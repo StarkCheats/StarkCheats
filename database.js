@@ -1,51 +1,31 @@
-const sqlite3 = require('sqlite3').verbose();
-const { open } = require('sqlite');
-const path = require('path');
+const Parse = require('parse/node');
+require('dotenv').config();
 
+// Inicializar Parse (Back4App)
+Parse.initialize(
+    process.env.BACK4APP_APP_ID,
+    process.env.BACK4APP_JS_KEY,
+    process.env.BACK4APP_MASTER_KEY // Opcional, pero necesario para algunas operaciones admin
+);
+Parse.serverURL = 'https://parseapi.back4app.com/';
+
+// Esta función ahora solo exporta Parse o funciones de utilidad de Parse
+// para ser un reemplazo compatible ("drop-in") visual con el router
 async function getDB() {
-    const db = await open({
-        filename: path.join(__dirname, 'database.sqlite'),
-        driver: sqlite3.Database
-    });
-
-    // Configurar e inicializar tablas
-    await db.exec(`
-        CREATE TABLE IF NOT EXISTS Users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT, 
-            two_factor_enabled INTEGER DEFAULT 0,
-            balance REAL DEFAULT 0.00,
-            role TEXT DEFAULT 'user',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS VerificationCodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT NOT NULL,
-            code TEXT NOT NULL,
-            expires_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS Transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount REAL NOT NULL,
-            type TEXT NOT NULL,
-            status TEXT DEFAULT 'completed',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES Users(id)
-        );
-    `);
-
-    // Migración simple: Asegurar que existan nuevas columnas en tablas viejas
-    try {
-        await db.exec("ALTER TABLE Users ADD COLUMN two_factor_enabled INTEGER DEFAULT 0");
-    } catch (e) {
-        // Ignorar si la columna ya existe
+    // Verificar que las credenciales existen
+    if (!process.env.BACK4APP_APP_ID || !process.env.BACK4APP_JS_KEY) {
+        console.error("⚠️ ADVERTENCIA: Las variables de entorno de Back4App no están configuradas.");
+        console.error("Por favor, configura BACK4APP_APP_ID y BACK4APP_JS_KEY en tu archivo .env");
     }
 
-    return db;
+    return {
+        // En lugar de devolver una instancia de SQLite,
+        // devolvemos un wrapper o simplemente Parse para que el server lo use
+        Parse: Parse,
+        
+        // Exportamos utilidades para facilitar logs o migraciones
+        isParse: true
+    };
 }
 
-module.exports = { getDB };
+module.exports = { getDB, Parse };

@@ -4,7 +4,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const { OAuth2Client } = require('google-auth-library');
-const { getDB } = require('./database');
+const { getDB, Parse } = require('./database');
 const path = require('path');
 const crypto = require('crypto');
 
@@ -112,7 +112,7 @@ app.post('/api/auth/send-code', async (req, res) => {
         const { email } = req.body;
         if (!email || !email.includes('@')) return res.status(400).json({ error: 'Email inválido' });
 
-        const db = await getDB();
+        await getDB();
         
         // Generar PIN de 6 dígitos
         const pin = Math.floor(100000 + Math.random() * 900000).toString();
@@ -120,10 +120,12 @@ app.post('/api/auth/send-code', async (req, res) => {
         // Expira en 10 minutos
         const expiresAt = Date.now() + 10 * 60000;
         
-        await db.run(
-            'INSERT INTO VerificationCodes (email, code, expires_at) VALUES (?, ?, ?)',
-            [email, pin, expiresAt]
-        );
+        const VerificationCode = Parse.Object.extend("VerificationCode");
+        const codeObj = new VerificationCode();
+        codeObj.set("email", email);
+        codeObj.set("code", pin);
+        codeObj.set("expires_at", expiresAt);
+        await codeObj.save();
 
         // Plantilla de Correo Profesional
         const emailHtml = `
@@ -193,29 +195,50 @@ app.post('/api/auth/verify', async (req, res) => {
         const { email, code } = req.body;
         if (!email || !code) return res.status(400).json({ error: 'Email y código requeridos' });
 
-        const db = await getDB();
+        await getDB();
         
-        // Buscar si el código existe y es válido (Comparación numérica)
+        // Buscar si el código existe y es válido
         const now = Date.now();
-        const record = await db.get(
-            'SELECT * FROM VerificationCodes WHERE email = ? AND code = ? AND expires_at > ? ORDER BY id DESC LIMIT 1',
-            [email, code, now]
-        );
+        const query = new Parse.Query("VerificationCode");
+        query.equalTo("email", email);
+        query.equalTo("code", code);
+        query.greaterThan("expires_at", now);
+        query.descending("createdAt");
+        const record = await query.first();
 
         if (!record) {
             console.log(`[Auth Fail] User: ${email}, Code: ${code}, Now: ${now}`);
             return res.status(401).json({ error: 'Código inválido o expirado' });
         }
 
-        // Ya fue usado, lo borramos (opcional, pero buena práctica)
-        await db.run('DELETE FROM VerificationCodes WHERE email = ?', [email]);
+        // Ya fue usado, lo borramos
+        const delQuery = new Parse.Query("VerificationCode");
+        delQuery.equalTo("email", email);
+        const codesToDelete = await delQuery.find();
+        await Parse.Object.destroyAll(codesToDelete);
 
         // Verificar si el usuario existe, si no, lo creamos
-        let user = await db.get('SELECT * FROM Users WHERE email = ?', [email]);
-        if (!user) {
-            const result = await db.run('INSERT INTO Users (email) VALUES (?)', [email]);
-            user = { id: result.lastID, email, balance: 0.00, role: 'user' };
+        const userQuery = new Parse.Query(Parse.User);
+        userQuery.equalTo("email", email);
+        let parseUser = await userQuery.first({ useMasterKey: true });
+        
+        if (!parseUser) {
+            parseUser = new Parse.User();
+            parseUser.set("username", email);
+            parseUser.set("email", email);
+            parseUser.set("password", "default_" + Math.random().toString(36).slice(-8)); 
+            parseUser.set("balance", 0.00);
+            parseUser.set("role", "user");
+            parseUser.set("two_factor_enabled", false);
+            await parseUser.signUp();
         }
+        
+        let user = { 
+            id: parseUser.id, 
+            email: parseUser.get("email"), 
+            balance: parseUser.get("balance") || 0.00,
+            role: parseUser.get("role") || "user"
+        };
 
         // Generar Token JWT
         const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
@@ -295,23 +318,41 @@ app.post('/api/auth/google', async (req, res) => {
 
         if (!email) return res.status(400).json({ error: 'No se pudo obtener el email de Google' });
 
-        const db = await getDB();
+        await getDB();
         
         // Verificar si el usuario existe, si no, lo creamos
-        let user = await db.get('SELECT * FROM Users WHERE email = ?', [email]);
-        if (!user) {
-            const result = await db.run('INSERT INTO Users (email) VALUES (?)', [email]);
-            user = { id: result.lastID, email, balance: 0.00, role: 'user' };
+        const userQuery = new Parse.Query(Parse.User);
+        userQuery.equalTo("email", email);
+        let parseUser = await userQuery.first({ useMasterKey: true });
+        
+        if (!parseUser) {
+            parseUser = new Parse.User();
+            parseUser.set("username", email);
+            parseUser.set("email", email);
+            parseUser.set("password", "default_" + Math.random().toString(36).slice(-8)); 
+            parseUser.set("balance", 0.00);
+            parseUser.set("role", "user");
+            parseUser.set("two_factor_enabled", false);
+            await parseUser.signUp();
         }
+
+        let user = { 
+            id: parseUser.id, 
+            email: parseUser.get("email"), 
+            balance: parseUser.get("balance") || 0.00,
+            role: parseUser.get("role") || "user"
+        };
 
         // --- LÓGICA DE 2FA PARA GOOGLE ---
         const pin = Math.floor(100000 + Math.random() * 900000).toString();
-        const expiresAt = new Date(Date.now() + 10 * 60000).toISOString();
+        const expiresAt = Date.now() + 10 * 60000; // Guardamos timestamp numérico para consistencia
 
-        await db.run(
-            'INSERT INTO VerificationCodes (email, code, expires_at) VALUES (?, ?, ?)',
-            [email, pin, expiresAt]
-        );
+        const VerificationCode = Parse.Object.extend("VerificationCode");
+        const codeObj = new VerificationCode();
+        codeObj.set("email", email);
+        codeObj.set("code", pin);
+        codeObj.set("expires_at", expiresAt);
+        await codeObj.save();
 
         // Plantilla de Correo (Notificación + PIN)
         const emailHtml = `
@@ -414,21 +455,43 @@ app.get('/api/auth/discord/callback', async (req, res) => {
 
         if (!email) return res.status(400).send('No se pudo obtener el email de Discord.');
 
-        const db = await getDB();
+        await getDB();
         
         // Verificar o crear usuario
-        let user = await db.get('SELECT * FROM Users WHERE email = ?', [email]);
-        if (!user) {
-            const result = await db.run('INSERT INTO Users (email) VALUES (?)', [email]);
-            user = { id: result.lastID, email, balance: 0.00, role: 'user' };
+        const userQuery = new Parse.Query(Parse.User);
+        userQuery.equalTo("email", email);
+        let parseUser = await userQuery.first({ useMasterKey: true });
+        
+        if (!parseUser) {
+            parseUser = new Parse.User();
+            parseUser.set("username", email);
+            parseUser.set("email", email);
+            parseUser.set("password", "default_" + Math.random().toString(36).slice(-8)); 
+            parseUser.set("balance", 0.00);
+            parseUser.set("role", "user");
+            parseUser.set("two_factor_enabled", false);
+            await parseUser.signUp();
         }
+
+        let user = { 
+            id: parseUser.id, 
+            email: parseUser.get("email"), 
+            balance: parseUser.get("balance") || 0.00,
+            role: parseUser.get("role") || "user",
+            two_factor_enabled: parseUser.get("two_factor_enabled") || false
+        };
 
         // Check if 2FA is enabled
         if (user.two_factor_enabled) {
             // Generate PIN
             const pin = Math.floor(100000 + Math.random() * 900000).toString();
             const expiresAt = Date.now() + 10 * 60000;
-            await db.run('INSERT INTO VerificationCodes (email, code, expires_at) VALUES (?, ?, ?)', [email, pin, expiresAt]);
+            const VerificationCode = Parse.Object.extend("VerificationCode");
+            const codeObj = new VerificationCode();
+            codeObj.set("email", email);
+            codeObj.set("code", pin);
+            codeObj.set("expires_at", expiresAt);
+            await codeObj.save();
 
             // Professional 2FA Email
             const emailHtml = `
@@ -497,11 +560,19 @@ app.get('/api/auth/discord/callback', async (req, res) => {
 // 3. Obtener info del usuario actual
 app.get('/api/user/me', authenticateToken, async (req, res) => {
     try {
-        const db = await getDB();
-        const user = await db.get('SELECT id, email, balance, two_factor_enabled, (password IS NOT NULL) as has_password FROM Users WHERE id = ?', [req.user.id]);
-        if(!user) return res.status(404).json({error: 'Usuario no encontrado'});
+        await getDB();
+        const userQuery = new Parse.Query(Parse.User);
+        const parseUser = await userQuery.get(req.user.id, { useMasterKey: true });
         
-        res.json(user);
+        if(!parseUser) return res.status(404).json({error: 'Usuario no encontrado'});
+        
+        res.json({
+            id: parseUser.id,
+            email: parseUser.get("email"),
+            balance: parseUser.get("balance") || 0.00,
+            two_factor_enabled: parseUser.get("two_factor_enabled") ? 1 : 0,
+            has_password: 1
+        });
     } catch (error) {
         console.error("DEBUG ME ERROR:", error);
         res.status(500).json({ error: 'Error del servidor: ' + (error.message || 'Error desconocido') });
@@ -518,20 +589,25 @@ app.post('/api/payments/deposit', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Monto inválido. Mínimo $5.' });
         }
 
-        const db = await getDB();
+        await getDB();
+        
+        const userQuery = new Parse.Query(Parse.User);
+        const parseUser = await userQuery.get(req.user.id, { useMasterKey: true });
         
         // Actualizar balance
-        await db.run('UPDATE Users SET balance = balance + ? WHERE id = ?', [depositAmount, req.user.id]);
+        parseUser.increment("balance", depositAmount);
+        await parseUser.save(null, { useMasterKey: true });
         
         // Registrar transacción
-        await db.run(
-            'INSERT INTO Transactions (user_id, amount, type, status) VALUES (?, ?, ?, ?)',
-            [req.user.id, depositAmount, 'deposit', 'completed']
-        );
+        const Transaction = Parse.Object.extend("Transaction");
+        const txObj = new Transaction();
+        txObj.set("user", parseUser);
+        txObj.set("amount", depositAmount);
+        txObj.set("type", "deposit");
+        txObj.set("status", "completed");
+        await txObj.save();
 
-        const updatedUser = await db.get('SELECT balance FROM Users WHERE id = ?', [req.user.id]);
-
-        res.json({ message: 'Depósito exitoso', newBalance: updatedUser.balance });
+        res.json({ message: 'Depósito exitoso', newBalance: parseUser.get("balance") });
     } catch (error) {
         res.status(500).json({ error: 'Error procesando depósito' });
     }
@@ -541,26 +617,31 @@ app.post('/api/payments/deposit', authenticateToken, async (req, res) => {
 app.post('/api/payments/purchase', authenticateToken, async (req, res) => {
     try {
         const { productId, price } = req.body;
-        const db = await getDB();
+        await getDB();
         
-        const user = await db.get('SELECT balance FROM Users WHERE id = ?', [req.user.id]);
+        const userQuery = new Parse.Query(Parse.User);
+        const parseUser = await userQuery.get(req.user.id, { useMasterKey: true });
         
-        if(user.balance < price) {
+        const currentBalance = parseUser.get("balance") || 0;
+        
+        if(currentBalance < price) {
             return res.status(400).json({ error: 'Saldo insuficiente' });
         }
 
         // Descontar saldo
-        await db.run('UPDATE Users SET balance = balance - ? WHERE id = ?', [price, req.user.id]);
+        parseUser.increment("balance", -price);
+        await parseUser.save(null, { useMasterKey: true });
         
         // Registrar compra
-        await db.run(
-            'INSERT INTO Transactions (user_id, amount, type, status) VALUES (?, ?, ?, ?)',
-            [req.user.id, -price, 'purchase', 'completed']
-        );
+        const Transaction = Parse.Object.extend("Transaction");
+        const txObj = new Transaction();
+        txObj.set("user", parseUser);
+        txObj.set("amount", -price);
+        txObj.set("type", "purchase");
+        txObj.set("status", "completed");
+        await txObj.save();
 
-        const updatedUser = await db.get('SELECT balance FROM Users WHERE id = ?', [req.user.id]);
-        
-        res.json({ message: 'Compra exitosa', newBalance: updatedUser.balance });
+        res.json({ message: 'Compra exitosa', newBalance: parseUser.get("balance") });
     } catch (error) {
         res.status(500).json({ error: 'Error procesando la compra' });
     }
@@ -570,21 +651,22 @@ app.post('/api/payments/purchase', authenticateToken, async (req, res) => {
 app.post('/api/payments/crypto/start', authenticateToken, async (req, res) => {
     try {
         const { amount, type, productId } = req.body; // type: 'deposit' o 'purchase'
-        const db = await getDB();
+        await getDB();
 
-        // En un entorno real, la pasarela generaría la dirección y devolvería la conversión.
-        // Aquí le damos esta info al frontend para que la base de datos se encargue de saber
-        // en qué divisa está esperando el pago al aprobarse.
+        const userQuery = new Parse.Query(Parse.User);
+        const parseUser = await userQuery.get(req.user.id, { useMasterKey: true });
         
-        // Registrar transacción pendiente
-        const result = await db.run(
-            'INSERT INTO Transactions (user_id, amount, type, status) VALUES (?, ?, ?, ?)',
-            [req.user.id, amount, type === 'deposit' ? 'deposit_pending' : 'purchase_pending', 'pending']
-        );
+        const Transaction = Parse.Object.extend("Transaction");
+        const txObj = new Transaction();
+        txObj.set("user", parseUser);
+        txObj.set("amount", amount);
+        txObj.set("type", type === 'deposit' ? 'deposit_pending' : 'purchase_pending');
+        txObj.set("status", "pending");
+        await txObj.save();
 
         res.json({
-            transactionId: result.lastID,
-            usdAmount: amount, // El frontend manejará las conversiones y direcciones
+            transactionId: txObj.id,
+            usdAmount: amount,
             message: 'Esperando selección y pago en la red'
         });
 
@@ -597,26 +679,36 @@ app.post('/api/payments/crypto/start', authenticateToken, async (req, res) => {
 app.post('/api/payments/crypto/verify/:id', authenticateToken, async (req, res) => {
     try {
         const txId = req.params.id;
-        const db = await getDB();
+        await getDB();
         
-        const tx = await db.get('SELECT * FROM Transactions WHERE id = ? AND user_id = ? AND status = "pending"', [txId, req.user.id]);
+        const txQuery = new Parse.Query("Transaction");
+        txQuery.equalTo("objectId", txId);
+        txQuery.equalTo("status", "pending");
+        
+        const tx = await txQuery.first();
         if (!tx) return res.status(404).json({ error: 'Transacción no encontrada o ya procesada' });
 
-        // Simular que, si han pasado X segundos o si el usuario le da "Verificar", la red lo aprueba
-        // En la vida real, ESTE ENDPOINT ES REEMPLAZADO POR UN WEBHOOK que llama la pasarela (ej. Stripe, Coinbase Commerce).
-
-        if (tx.type === 'deposit_pending') {
-            await db.run('UPDATE Users SET balance = balance + ? WHERE id = ?', [tx.amount, req.user.id]);
-            await db.run('UPDATE Transactions SET status = "completed", type = "deposit" WHERE id = ?', [txId]);
-        } else if (tx.type === 'purchase_pending') {
-            // Si era compra directa y la pagó
-            await db.run('UPDATE Transactions SET status = "completed", type = "purchase" WHERE id = ?', [txId]);
-            // (La entrega del producto se haría aquí)
+        const userObj = tx.get("user");
+        await userObj.fetch({ useMasterKey: true });
+        
+        if (userObj.id !== req.user.id) {
+            return res.status(403).json({ error: 'Operación no permitida' });
         }
 
-        const updatedUser = await db.get('SELECT balance FROM Users WHERE id = ?', [req.user.id]);
-        
-        res.json({ message: 'Pago confirmado en la Blockchain', newBalance: updatedUser.balance });
+        if (tx.get("type") === 'deposit_pending') {
+            userObj.increment("balance", tx.get("amount"));
+            await userObj.save(null, { useMasterKey: true });
+            
+            tx.set("status", "completed");
+            tx.set("type", "deposit");
+            await tx.save();
+        } else if (tx.get("type") === 'purchase_pending') {
+            tx.set("status", "completed");
+            tx.set("type", "purchase");
+            await tx.save();
+        }
+
+        res.json({ message: 'Pago confirmado en la Blockchain', newBalance: userObj.get("balance") });
 
     } catch (error) {
         res.status(500).json({ error: 'Error verificando pago' });
@@ -628,15 +720,17 @@ app.post('/api/security/request-change', authenticateToken, async (req, res) => 
     try {
         const { type } = req.body; // 'password' or '2fa'
         const email = req.user.email;
-        const db = await getDB();
+        await getDB();
         
         const code = Math.floor(100000 + Math.random() * 900000).toString();
         const expiresAt = Date.now() + 10 * 60000; // Unix timestamp in ms
         
-        await db.run(
-            'INSERT INTO VerificationCodes (email, code, expires_at) VALUES (?, ?, ?)',
-            [email, code, expiresAt]
-        );
+        const VerificationCode = Parse.Object.extend("VerificationCode");
+        const codeObj = new VerificationCode();
+        codeObj.set("email", email);
+        codeObj.set("code", code);
+        codeObj.set("expires_at", expiresAt);
+        await codeObj.save();
 
         const emailHtml = `
         <!DOCTYPE html>
@@ -697,26 +791,33 @@ app.post('/api/security/confirm-change', authenticateToken, async (req, res) => 
     try {
         const { type, code, password, enabled } = req.body;
         const email = req.user.email;
-        const db = await getDB();
+        await getDB();
 
-        // Check code - Comparison with numeric timestamp
         const now = Date.now();
-        const record = await db.get(
-            "SELECT * FROM VerificationCodes WHERE email = ? AND code = ? AND expires_at > ? ORDER BY id DESC LIMIT 1",
-            [email, code, now]
-        );
+        const query = new Parse.Query("VerificationCode");
+        query.equalTo("email", email);
+        query.equalTo("code", code);
+        query.greaterThan("expires_at", now);
+        query.descending("createdAt");
+        const record = await query.first();
 
         if (!record) {
             console.log(`[Security Fail] User: ${email}, Code: ${code}, Now: ${now}`);
             return res.status(401).json({ error: 'Invalid or expired code' });
         }
 
-        // Clean up code after verification
-        await db.run('DELETE FROM VerificationCodes WHERE email = ? AND code = ?', [email, code]);
+        const delQuery = new Parse.Query("VerificationCode");
+        delQuery.equalTo("email", email);
+        delQuery.equalTo("code", code);
+        const codesToDelete = await delQuery.find();
+        await Parse.Object.destroyAll(codesToDelete);
 
         if (type === '2fa') {
             const isEnabled = enabled === true || enabled === 1;
-            await db.run('UPDATE Users SET two_factor_enabled = ? WHERE id = ?', [isEnabled ? 1 : 0, req.user.id]);
+            const userQuery = new Parse.Query(Parse.User);
+            const parseUser = await userQuery.get(req.user.id, { useMasterKey: true });
+            parseUser.set("two_factor_enabled", isEnabled);
+            await parseUser.save(null, { useMasterKey: true });
             console.log(`[Security] 2FA ${isEnabled ? 'enabled' : 'disabled'} for user ${req.user.id}`);
         } else {
             return res.status(400).json({ error: 'Invalid update type' });
